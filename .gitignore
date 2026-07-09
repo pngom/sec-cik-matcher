@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+logs/
+*.log
+.streamlit/secrets.toml
+data/sec_companies.parquet
+data/sec_companies.csv
+*.tmp

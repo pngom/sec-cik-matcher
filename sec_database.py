@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import argparse
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import requests
+
+from config import (
+    ALIAS_FILE,
+    DATA_DIR,
+    SEC_CACHE_FALLBACK_FILE,
+    SEC_CACHE_FILE,
+    SEC_CIK_LOOKUP_URL,
+    SEC_COMPANY_TICKERS_URL,
+    SEC_USER_AGENT_ENV,
+)
+from utils import logger, normalize_company_name
+
+REQUIRED_COLUMNS = ["cik", "name", "ticker", "source", "normalized_name", "updated_at"]
+
+FALLBACK_COMPANIES = [
+    {"cik": "0000320193", "name": "Apple Inc.", "ticker": "AAPL", "source": "fallback"},
+    {"cik": "0000789019", "name": "Microsoft Corp", "ticker": "MSFT", "source": "fallback"},
+    {"cik": "0001652044", "name": "Alphabet Inc.", "ticker": "GOOGL", "source": "fallback"},
+    {"cik": "0001326801", "name": "Meta Platforms, Inc.", "ticker": "META", "source": "fallback"},
+    {"cik": "0001018724", "name": "Amazon.com, Inc.", "ticker": "AMZN", "source": "fallback"},
+    {"cik": "0001318605", "name": "Tesla, Inc.", "ticker": "TSLA", "source": "fallback"},
+    {"cik": "0001045810", "name": "NVIDIA Corp", "ticker": "NVDA", "source": "fallback"},
+]
+
+
+def _current_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _sec_headers() -> dict[str, str]:
+    user_agent = os.getenv(SEC_USER_AGENT_ENV, "sec-cik-matcher/0.1 local-development afro_cat@yahoo.com")
+    return {
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "www.sec.gov",
+    }
+
+
+def parse_company_tickers(payload: dict[str, Any]) -> pd.DataFrame:
+    records = []
+    for item in payload.values():
+        cik = str(item.get("cik_str", "")).zfill(10)
+        name = str(item.get("title", "")).strip()
+        ticker = str(item.get("ticker", "")).strip().upper()
+        if cik and name:
+            records.append({"cik": cik, "name": name, "ticker": ticker, "source": "sec_company_tickers"})
+
+    return prepare_sec_dataframe(pd.DataFrame.from_records(records))
+
+
+def parse_cik_lookup_text(text: str) -> pd.DataFrame:
+    records = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line:
+            continue
+
+        match = re.match(r"^(.+):(\d{1,10}):?$", line)
+        if not match:
+            logger.debug("Skipping unparseable CIK lookup line: %s", line)
+            continue
+
+        name = match.group(1).strip()
+        cik = match.group(2).zfill(10)
+        if name and cik:
+            records.append({"cik": cik, "name": name, "ticker": "", "source": "sec_cik_lookup"})
+
+    return prepare_sec_dataframe(pd.DataFrame.from_records(records))
+
+
+def enrich_with_tickers(cik_df: pd.DataFrame, ticker_df: pd.DataFrame) -> pd.DataFrame:
+    if ticker_df.empty:
+        return cik_df
+
+    enriched = cik_df.copy()
+    ticker_by_cik = (
+        ticker_df[ticker_df["ticker"].astype(str).str.strip().ne("")]
+        .drop_duplicates(subset=["cik"])
+        .set_index("cik")["ticker"]
+    )
+    enriched["ticker"] = enriched["cik"].map(ticker_by_cik).fillna(enriched["ticker"]).fillna("")
+    enriched.loc[enriched["ticker"].astype(str).str.strip().ne(""), "source"] = "sec_cik_lookup+tickers"
+
+    existing_pairs = set(zip(enriched["cik"], enriched["normalized_name"]))
+    missing_ticker_rows = ticker_df[
+        ~ticker_df.apply(lambda row: (row["cik"], row["normalized_name"]) in existing_pairs, axis=1)
+    ]
+    if not missing_ticker_rows.empty:
+        enriched = pd.concat([enriched, missing_ticker_rows], ignore_index=True)
+
+    return prepare_sec_dataframe(enriched)
+
+
+def prepare_sec_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    prepared = df.copy()
+    for column in ["cik", "name", "ticker", "source"]:
+        if column not in prepared.columns:
+            prepared[column] = ""
+
+    prepared["cik"] = prepared["cik"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(10)
+    prepared["name"] = prepared["name"].astype(str).str.strip()
+    prepared["ticker"] = prepared["ticker"].fillna("").astype(str).str.upper().str.strip()
+    prepared["source"] = prepared["source"].fillna("unknown").astype(str)
+    prepared["normalized_name"] = prepared["name"].map(normalize_company_name)
+    prepared["updated_at"] = _current_timestamp()
+    prepared = prepared[prepared["name"].ne("") & prepared["cik"].str.fullmatch(r"\d{10}")]
+    prepared = prepared.drop_duplicates(subset=["cik", "normalized_name"]).reset_index(drop=True)
+    return prepared[REQUIRED_COLUMNS]
+
+
+def fallback_database() -> pd.DataFrame:
+    return prepare_sec_dataframe(pd.DataFrame.from_records(FALLBACK_COMPANIES))
+
+
+def download_sec_database(timeout: int = 45) -> pd.DataFrame:
+    logger.info("Downloading SEC CIK lookup data from %s", SEC_CIK_LOOKUP_URL)
+    cik_response = requests.get(SEC_CIK_LOOKUP_URL, headers=_sec_headers(), timeout=timeout)
+    cik_response.raise_for_status()
+    cik_df = parse_cik_lookup_text(cik_response.text)
+    logger.info("Parsed %s SEC CIK lookup records", len(cik_df))
+
+    try:
+        logger.info("Downloading SEC ticker data from %s", SEC_COMPANY_TICKERS_URL)
+        ticker_response = requests.get(SEC_COMPANY_TICKERS_URL, headers=_sec_headers(), timeout=timeout)
+        ticker_response.raise_for_status()
+        ticker_df = parse_company_tickers(ticker_response.json())
+    except Exception as exc:
+        logger.exception("Ticker enrichment failed. Continuing with CIK-only data. Error: %s", exc)
+        ticker_df = pd.DataFrame(columns=REQUIRED_COLUMNS)
+
+    enriched = enrich_with_tickers(cik_df, ticker_df)
+    logger.info("Built combined SEC database with %s records", len(enriched))
+    return enriched
+
+
+def write_sec_database(df: pd.DataFrame, cache_path: Path | None = None) -> Path:
+    cache_path = cache_path or SEC_CACHE_FILE
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(cache_path, index=False)
+        logger.info("Wrote SEC cache to %s with %s records", cache_path, len(df))
+        return cache_path
+    except Exception as exc:
+        logger.warning("Parquet write failed (%s). Falling back to CSV.", exc)
+        df.to_csv(SEC_CACHE_FALLBACK_FILE, index=False)
+        logger.info("Wrote SEC cache to %s with %s records", SEC_CACHE_FALLBACK_FILE, len(df))
+        return SEC_CACHE_FALLBACK_FILE
+
+
+def read_sec_database(cache_path: Path | None = None) -> pd.DataFrame:
+    cache_path = cache_path or SEC_CACHE_FILE
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+    if SEC_CACHE_FALLBACK_FILE.exists():
+        return pd.read_csv(SEC_CACHE_FALLBACK_FILE, dtype={"cik": str})
+    logger.warning("No SEC cache found. Using built-in fallback records.")
+    return fallback_database()
+
+
+def build_sec_database(force: bool = False) -> pd.DataFrame:
+    if not force and (SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists()):
+        return read_sec_database()
+
+    try:
+        df = download_sec_database()
+    except Exception as exc:
+        if SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists():
+            logger.exception("SEC download failed. Keeping existing cache. Error: %s", exc)
+            return read_sec_database()
+        logger.exception("SEC download failed and no cache exists. Using fallback database. Error: %s", exc)
+        df = fallback_database()
+
+    write_sec_database(df)
+    ensure_alias_file()
+    return df
+
+
+def ensure_alias_file(path: Path = ALIAS_FILE) -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        pd.DataFrame(
+            [
+                {"alias": "Google", "canonical_name": "Alphabet Inc.", "cik": "0001652044"},
+                {"alias": "Facebook", "canonical_name": "Meta Platforms, Inc.", "cik": "0001326801"},
+                {"alias": "Meta", "canonical_name": "Meta Platforms, Inc.", "cik": "0001326801"},
+            ]
+        ).to_csv(path, index=False)
+    return path
+
+
+def load_aliases(path: Path = ALIAS_FILE) -> pd.DataFrame:
+    ensure_alias_file(path)
+    aliases = pd.read_csv(path, dtype=str).fillna("")
+    required = ["alias", "canonical_name", "cik"]
+    for column in required:
+        if column not in aliases.columns:
+            aliases[column] = ""
+    aliases["normalized_alias"] = aliases["alias"].map(normalize_company_name)
+    aliases["cik"] = aliases["cik"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(10)
+    return aliases[required + ["normalized_alias"]]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build or refresh the local SEC company cache.")
+    parser.add_argument("--force", action="store_true", help="Refresh even when a cache already exists.")
+    args = parser.parse_args()
+    df = build_sec_database(force=args.force)
+    print(f"SEC database ready: {len(df):,} companies")
+
+
+if __name__ == "__main__":
+    main()
