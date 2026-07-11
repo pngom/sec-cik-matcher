@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from config import (
     SEC_CACHE_FILE,
     SEC_CIK_LOOKUP_URL,
     SEC_COMPANY_TICKERS_URL,
+    SEC_SQLITE_FILE,
     SEC_USER_AGENT_ENV,
 )
 from utils import logger, normalize_company_name
@@ -150,12 +152,53 @@ def write_sec_database(df: pd.DataFrame, cache_path: Path | None = None) -> Path
     try:
         df.to_parquet(cache_path, index=False)
         logger.info("Wrote SEC cache to %s with %s records", cache_path, len(df))
+        write_sqlite_database(df)
         return cache_path
     except Exception as exc:
         logger.warning("Parquet write failed (%s). Falling back to CSV.", exc)
         df.to_csv(SEC_CACHE_FALLBACK_FILE, index=False)
+        write_sqlite_database(df)
         logger.info("Wrote SEC cache to %s with %s records", SEC_CACHE_FALLBACK_FILE, len(df))
         return SEC_CACHE_FALLBACK_FILE
+
+
+def write_sqlite_database(df: pd.DataFrame, sqlite_path: Path | None = None) -> Path:
+    sqlite_path = sqlite_path or SEC_SQLITE_FILE
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    indexed = df[REQUIRED_COLUMNS].copy()
+    indexed["first_token"] = indexed["normalized_name"].astype(str).str.split(" ").str[0]
+    indexed["fuzzy_prefix"] = indexed["normalized_name"].astype(str).str[:3]
+
+    temp_path = sqlite_path.with_name(f"{sqlite_path.stem}.{os.getpid()}.tmp.sqlite")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    conn = sqlite3.connect(temp_path)
+    try:
+        indexed.to_sql("companies", conn, index=False, if_exists="replace", chunksize=50_000)
+        conn.execute("CREATE INDEX idx_companies_normalized_name ON companies(normalized_name)")
+        conn.execute("CREATE INDEX idx_companies_cik ON companies(cik)")
+        conn.execute("CREATE INDEX idx_companies_ticker ON companies(ticker)")
+        conn.execute("CREATE INDEX idx_companies_first_token ON companies(first_token)")
+        conn.execute("CREATE INDEX idx_companies_fuzzy_prefix ON companies(fuzzy_prefix)")
+        conn.execute("CREATE INDEX idx_companies_prefix_name ON companies(first_token, normalized_name)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if sqlite_path.exists():
+        sqlite_path.unlink()
+    temp_path.replace(sqlite_path)
+    logger.info("Wrote SEC SQLite index to %s with %s records", sqlite_path, len(indexed))
+    return sqlite_path
+
+
+def ensure_sqlite_database() -> Path:
+    if SEC_SQLITE_FILE.exists():
+        return SEC_SQLITE_FILE
+    df = read_sec_database()
+    write_sqlite_database(df)
+    return SEC_SQLITE_FILE
 
 
 def read_sec_database(cache_path: Path | None = None) -> pd.DataFrame:
@@ -169,6 +212,9 @@ def read_sec_database(cache_path: Path | None = None) -> pd.DataFrame:
 
 
 def sec_database_summary() -> dict[str, Any]:
+    if SEC_SQLITE_FILE.exists():
+        size_mb = SEC_SQLITE_FILE.stat().st_size / (1024 * 1024)
+        return {"status": f"{size_mb:.1f} MB SQLite", "is_fallback": SEC_SQLITE_FILE.stat().st_size < 100_000}
     if SEC_CACHE_FILE.exists():
         size_mb = SEC_CACHE_FILE.stat().st_size / (1024 * 1024)
         status = f"{size_mb:.1f} MB"
@@ -182,7 +228,10 @@ def sec_database_summary() -> dict[str, Any]:
 
 def build_sec_database(force: bool = False) -> pd.DataFrame:
     if not force and (SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists()):
-        return read_sec_database()
+        df = read_sec_database()
+        if not SEC_SQLITE_FILE.exists():
+            write_sqlite_database(df)
+        return df
 
     try:
         df = download_sec_database()

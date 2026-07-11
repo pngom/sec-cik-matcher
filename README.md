@@ -6,7 +6,7 @@ A Streamlit app for matching uploaded company names to SEC company metadata and 
 
 - Polished Streamlit upload, demo, review, and export workflow
 - Dedicated SEC cache builder using the broad SEC CIK lookup feed plus ticker enrichment
-- Persistent local cache in `data/sec_companies.parquet` with CSV fallback
+- Persistent local cache in `data/sec_companies.parquet` plus an indexed SQLite matcher cache
 - High-performance fuzzy matching with RapidFuzz
 - Alias management through `data/aliases.csv`
 - Automatic company-name column detection
@@ -68,3 +68,5 @@ Required columns:
 ## SEC Data Notes
 
 The app first downloads `https://www.sec.gov/Archives/edgar/cik-lookup-data.txt` to match company names and retrieve CIK numbers. It then downloads `https://www.sec.gov/files/company_tickers.json` and enriches rows with ticker symbols by CIK when a public ticker exists. SEC access policies expect automated tools to identify themselves with a descriptive `User-Agent`; use `SEC_USER_AGENT` for that value.
+
+The refresh process also builds `data/sec_companies.sqlite`, which the Streamlit app uses for low-memory matching on Streamlit Community Cloud.

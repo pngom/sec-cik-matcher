@@ -1,7 +1,8 @@
 import pandas as pd
 
-from matcher import MatchConfig, SECMatcher
+from matcher import MatchConfig, SECMatcher, SQLiteSECMatcher
 from sec_database import fallback_database
+import sec_database
 
 
 def test_matcher_finds_exact_and_alias_matches():
@@ -79,3 +80,24 @@ def test_ticker_index_keeps_first_company_name_for_duplicate_cik_rows():
     jnj = matcher.match_name("JNJ")
 
     assert jnj["match_name"] == "JOHNSON & JOHNSON"
+
+
+def test_sqlite_matcher_matches_without_in_memory_index(tmp_path):
+    sqlite_path = tmp_path / "sec_companies.sqlite"
+    sec_df = sec_database.prepare_sec_dataframe(
+        pd.DataFrame(
+            [
+                {"cik": "0000104169", "name": "WALMART INC.", "ticker": "WMT", "source": "test"},
+                {"cik": "0000724606", "name": "PANERA BREAD CO", "ticker": "", "source": "test"},
+            ]
+        )
+    )
+    sec_database.write_sqlite_database(sec_df, sqlite_path=sqlite_path)
+    matcher = SQLiteSECMatcher(sqlite_path=sqlite_path, aliases=pd.DataFrame(), config=MatchConfig(score_threshold=86))
+
+    walmart = matcher.match_name("Walmart")
+    panera = matcher.match_name("Panera")
+
+    assert walmart["match_cik"] == "0000104169"
+    assert walmart["match_ticker"] == "WMT"
+    assert panera["match_cik"] == "0000724606"

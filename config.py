@@ -10,6 +10,7 @@ DEMO_FILE = DATA_DIR / "demo_companies.csv"
 ALIAS_FILE = DATA_DIR / "aliases.csv"
 SEC_CACHE_FILE = DATA_DIR / "sec_companies.parquet"
 SEC_CACHE_FALLBACK_FILE = DATA_DIR / "sec_companies.csv"
+SEC_SQLITE_FILE = DATA_DIR / "sec_companies.sqlite"
 
 SEC_CIK_LOOKUP_URL = "https://www.sec.gov/Archives/edgar/cik-lookup-data.txt"
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"

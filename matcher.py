@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-from config import DEFAULT_MATCH_LIMIT, DEFAULT_SCORE_THRESHOLD
-from sec_database import load_aliases, read_sec_database
+from config import DEFAULT_MATCH_LIMIT, DEFAULT_SCORE_THRESHOLD, SEC_SQLITE_FILE
+from sec_database import ensure_sqlite_database, load_aliases, read_sec_database
 from utils import logger, normalize_company_name
 
 
@@ -227,3 +228,196 @@ def match_dataframe(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     matcher = SECMatcher(config=MatchConfig(score_threshold=score_threshold))
     return matcher.match_dataframe(df, company_column)
+
+
+class SQLiteSECMatcher:
+    def __init__(
+        self,
+        sqlite_path=SEC_SQLITE_FILE,
+        aliases: pd.DataFrame | None = None,
+        config: MatchConfig | None = None,
+    ) -> None:
+        self.config = config or MatchConfig()
+        self.sqlite_path = sqlite_path if sqlite_path.exists() else ensure_sqlite_database()
+        self.aliases = (aliases if aliases is not None else load_aliases()).copy().fillna("")
+        self.alias_index = {
+            normalize_company_name(row["alias"]): {
+                "cik": str(row.get("cik", "")).zfill(10),
+                "canonical_name": str(row.get("canonical_name", "")),
+            }
+            for row in self.aliases.to_dict("records")
+            if normalize_company_name(row.get("alias", ""))
+        }
+        logger.info("SQLite matcher initialized using %s", self.sqlite_path)
+
+    def match_name(self, company_name: object) -> dict[str, Any]:
+        query = normalize_company_name(company_name)
+        if not query:
+            return SECMatcher._empty_result(company_name, query)
+
+        with self._connect() as conn:
+            ticker_record = self._query_one(
+                conn,
+                """
+                SELECT * FROM companies
+                WHERE ticker = ?
+                ORDER BY length(normalized_name), normalized_name
+                LIMIT 1
+                """,
+                (query,),
+                source="ticker",
+            )
+            if ticker_record:
+                return SECMatcher._result(company_name, query, query, 100, ticker_record, "exact")
+
+            exact_record = self._query_one(
+                conn,
+                """
+                SELECT * FROM companies
+                WHERE normalized_name = ?
+                ORDER BY length(normalized_name), normalized_name
+                LIMIT 1
+                """,
+                (query,),
+            )
+            if exact_record:
+                return SECMatcher._result(company_name, query, query, 100, exact_record, "exact")
+
+            alias = self.alias_index.get(query)
+            if alias:
+                alias_record = self._alias_record(conn, alias)
+                if alias_record:
+                    return SECMatcher._result(company_name, query, query, 100, alias_record, "exact")
+
+            prefix_matches = self._prefix_matches(conn, query)
+            if prefix_matches:
+                record = self._row_to_record(prefix_matches[0])
+                status = "matched" if len(prefix_matches) == 1 else "review"
+                return SECMatcher._result(
+                    company_name,
+                    query,
+                    str(prefix_matches[0]["normalized_name"]),
+                    92.0,
+                    record,
+                    status,
+                )
+
+            fuzzy_match = self._fuzzy_match(conn, query)
+            if fuzzy_match is None:
+                return SECMatcher._empty_result(company_name, query)
+
+            row, score = fuzzy_match
+            record = self._row_to_record(row)
+            status = "matched" if score >= self.config.score_threshold else "review"
+            return SECMatcher._result(
+                company_name,
+                query,
+                str(row["normalized_name"]),
+                round(float(score), 2),
+                record,
+                status,
+            )
+
+    def match_dataframe(self, df: pd.DataFrame, company_column: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if company_column not in df.columns:
+            raise KeyError(f"Company column '{company_column}' was not found.")
+
+        results = [self.match_name(value) for value in df[company_column]]
+        result_df = pd.DataFrame(results)
+        output = pd.concat([df.reset_index(drop=True), result_df], axis=1)
+        summary = summarize_matches(output)
+        logger.info("Matched %s rows using SQLite cache and column '%s'", len(output), company_column)
+        return output, summary
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.sqlite_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _query_one(
+        self,
+        conn: sqlite3.Connection,
+        sql: str,
+        params: tuple[Any, ...],
+        source: str = "sec",
+    ) -> dict[str, Any] | None:
+        row = conn.execute(sql, params).fetchone()
+        if row is None:
+            return None
+        return self._row_to_record(row, source=source)
+
+    def _alias_record(self, conn: sqlite3.Connection, alias: dict[str, str]) -> dict[str, Any] | None:
+        if alias["cik"].strip("0"):
+            record = self._query_one(
+                conn,
+                """
+                SELECT * FROM companies
+                WHERE cik = ?
+                ORDER BY length(normalized_name), normalized_name
+                LIMIT 1
+                """,
+                (alias["cik"],),
+                source="alias",
+            )
+            if record:
+                return record
+
+        canonical = normalize_company_name(alias["canonical_name"])
+        if canonical:
+            return self._query_one(
+                conn,
+                """
+                SELECT * FROM companies
+                WHERE normalized_name = ?
+                ORDER BY length(normalized_name), normalized_name
+                LIMIT 1
+                """,
+                (canonical,),
+                source="alias",
+            )
+        return None
+
+    def _prefix_matches(self, conn: sqlite3.Connection, query: str) -> list[sqlite3.Row]:
+        if len(query) < 4:
+            return []
+        first_token = query.split(" ", 1)[0]
+        return conn.execute(
+            """
+            SELECT * FROM companies
+            WHERE first_token = ? AND normalized_name LIKE ?
+            ORDER BY length(normalized_name), normalized_name
+            LIMIT 25
+            """,
+            (first_token, f"{query} %"),
+        ).fetchall()
+
+    def _fuzzy_match(self, conn: sqlite3.Connection, query: str) -> tuple[sqlite3.Row, float] | None:
+        if len(query) < 3:
+            return None
+        rows = conn.execute(
+            """
+            SELECT * FROM companies
+            WHERE fuzzy_prefix = ?
+            ORDER BY length(normalized_name), normalized_name
+            LIMIT 5000
+            """,
+            (query[:3],),
+        ).fetchall()
+        if not rows:
+            return None
+
+        choices = [str(row["normalized_name"]) for row in rows]
+        match = process.extractOne(query, choices, scorer=fuzz.token_sort_ratio)
+        if not match:
+            return None
+        _, score, row_index = match
+        return rows[row_index], float(score)
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row, source: str = "sec") -> dict[str, Any]:
+        return {
+            "cik": str(row["cik"]).zfill(10),
+            "name": row["name"],
+            "ticker": row["ticker"],
+            "source": source,
+        }

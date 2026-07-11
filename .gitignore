@@ -7,4 +7,5 @@ logs/
 .streamlit/secrets.toml
 data/sec_companies.parquet
 data/sec_companies.csv
+data/sec_companies.sqlite
 *.tmp

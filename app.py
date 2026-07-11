@@ -10,10 +10,11 @@ from config import (
     DEMO_FILE,
     SEC_CACHE_FALLBACK_FILE,
     SEC_CACHE_FILE,
+    SEC_SQLITE_FILE,
 )
-from matcher import MatchConfig, SECMatcher
+from matcher import MatchConfig, SQLiteSECMatcher
 import sec_database
-from sec_database import build_sec_database, load_aliases, read_sec_database
+from sec_database import build_sec_database, load_aliases
 from utils import (
     dataframe_to_csv_bytes,
     dataframe_to_excel_bytes,
@@ -57,22 +58,16 @@ def load_demo() -> pd.DataFrame:
     return pd.read_csv(DEMO_FILE)
 
 
-@st.cache_data(show_spinner=False)
-def load_cached_sec_data(cache_signature: tuple[str, int, int]) -> pd.DataFrame:
-    return read_sec_database()
-
-
 @st.cache_resource(show_spinner=False)
-def get_matcher(score_threshold: int, cache_signature: tuple[str, int, int]) -> SECMatcher:
-    return SECMatcher(
-        sec_df=load_cached_sec_data(cache_signature),
+def get_matcher(score_threshold: int, cache_signature: tuple[str, int, int]) -> SQLiteSECMatcher:
+    return SQLiteSECMatcher(
         aliases=load_aliases(),
         config=MatchConfig(score_threshold=score_threshold),
     )
 
 
 def sec_cache_signature() -> tuple[str, int, int]:
-    for path in (SEC_CACHE_FILE, SEC_CACHE_FALLBACK_FILE):
+    for path in (SEC_SQLITE_FILE, SEC_CACHE_FILE, SEC_CACHE_FALLBACK_FILE):
         if path.exists():
             stat = path.stat()
             return (path.name, stat.st_size, int(stat.st_mtime))
@@ -92,7 +87,6 @@ def get_sec_database_summary() -> dict[str, object]:
 
 
 def reset_caches() -> None:
-    load_cached_sec_data.clear()
     get_matcher.clear()
 
 
@@ -114,7 +108,7 @@ def render_sidebar() -> int:
         st.write(f"SEC CSV: `{describe_file(SEC_CACHE_FALLBACK_FILE)}`")
         st.write(f"Aliases: `{describe_file(ALIAS_FILE)}`")
 
-        if st.button("Refresh SEC cache", use_container_width=True):
+        if st.button("Refresh SEC cache", width="stretch"):
             with st.spinner("Downloading SEC company data..."):
                 build_sec_database(force=True)
                 reset_caches()
@@ -176,9 +170,9 @@ def main() -> None:
     st.markdown(f'<span class="status-pill">Source: {source_name}</span>', unsafe_allow_html=True)
 
     with st.expander("Preview input", expanded=uploaded_file is None):
-        st.dataframe(df.head(100), use_container_width=True, hide_index=True)
+        st.dataframe(df.head(100), width="stretch", hide_index=True)
 
-    run_match = st.button("Match companies", type="primary", use_container_width=True)
+    run_match = st.button("Match companies", type="primary", width="stretch")
 
     if run_match:
         with st.spinner("Matching against SEC cache..."):
@@ -206,15 +200,15 @@ def main() -> None:
 
     tabs = st.tabs(["Matched File", "Review Queue", "Summary", "Aliases"])
     with tabs[0]:
-        st.dataframe(matched_df, use_container_width=True, hide_index=True)
+        st.dataframe(matched_df, width="stretch", hide_index=True)
     with tabs[1]:
         review_df = matched_df[matched_df["match_status"].isin(["review", "unmatched", "blank"])]
-        st.dataframe(review_df, use_container_width=True, hide_index=True)
+        st.dataframe(review_df, width="stretch", hide_index=True)
     with tabs[2]:
-        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.dataframe(summary, width="stretch", hide_index=True)
     with tabs[3]:
         aliases = load_aliases()
-        st.dataframe(aliases[["alias", "canonical_name", "cik"]], use_container_width=True, hide_index=True)
+        st.dataframe(aliases[["alias", "canonical_name", "cik"]], width="stretch", hide_index=True)
 
     download_cols = st.columns([1, 1, 2])
     with download_cols[0]:
@@ -223,7 +217,7 @@ def main() -> None:
             data=dataframe_to_csv_bytes(matched_df),
             file_name="sec_cik_matches.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
     with download_cols[1]:
         st.download_button(
@@ -231,7 +225,7 @@ def main() -> None:
             data=dataframe_to_excel_bytes(matched_df),
             file_name="sec_cik_matches.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
 
 
