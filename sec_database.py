@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import sqlite3
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -152,12 +155,22 @@ def write_sec_database(df: pd.DataFrame, cache_path: Path | None = None) -> Path
     try:
         df.to_parquet(cache_path, index=False)
         logger.info("Wrote SEC cache to %s with %s records", cache_path, len(df))
-        write_sqlite_database(df)
+        try:
+            write_sqlite_database(df)
+        except Exception:
+            if not SEC_SQLITE_FILE.exists():
+                raise
+            logger.exception("SQLite index refresh failed. Keeping existing SQLite cache.")
         return cache_path
     except Exception as exc:
         logger.warning("Parquet write failed (%s). Falling back to CSV.", exc)
         df.to_csv(SEC_CACHE_FALLBACK_FILE, index=False)
-        write_sqlite_database(df)
+        try:
+            write_sqlite_database(df)
+        except Exception:
+            if not SEC_SQLITE_FILE.exists():
+                raise
+            logger.exception("SQLite index refresh failed. Keeping existing SQLite cache.")
         logger.info("Wrote SEC cache to %s with %s records", SEC_CACHE_FALLBACK_FILE, len(df))
         return SEC_CACHE_FALLBACK_FILE
 
@@ -169,7 +182,7 @@ def write_sqlite_database(df: pd.DataFrame, sqlite_path: Path | None = None) -> 
     indexed["first_token"] = indexed["normalized_name"].astype(str).str.split(" ").str[0]
     indexed["fuzzy_prefix"] = indexed["normalized_name"].astype(str).str[:3]
 
-    temp_path = sqlite_path.with_name(f"{sqlite_path.stem}.{os.getpid()}.tmp.sqlite")
+    temp_path = sqlite_path.with_name(f"{sqlite_path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp.sqlite")
     if temp_path.exists():
         temp_path.unlink()
 
@@ -196,8 +209,11 @@ def write_sqlite_database(df: pd.DataFrame, sqlite_path: Path | None = None) -> 
 def ensure_sqlite_database() -> Path:
     if SEC_SQLITE_FILE.exists():
         return SEC_SQLITE_FILE
-    df = read_sec_database()
-    write_sqlite_database(df)
+    with cache_build_lock():
+        if SEC_SQLITE_FILE.exists():
+            return SEC_SQLITE_FILE
+        df = read_sec_database()
+        write_sqlite_database(df)
     return SEC_SQLITE_FILE
 
 
@@ -226,25 +242,65 @@ def sec_database_summary() -> dict[str, Any]:
     return {"status": "fallback", "is_fallback": True}
 
 
+@contextlib.contextmanager
+def cache_build_lock(timeout: int = 360):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = DATA_DIR / ".sec_cache_build.lock"
+    start = time.monotonic()
+    lock_fd = None
+
+    while True:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(lock_fd, f"{os.getpid()} {time.time()}".encode("utf-8"))
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+                if age > timeout:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+
+            if time.monotonic() - start > timeout:
+                raise TimeoutError("Timed out waiting for SEC cache refresh lock.")
+            logger.info("Another SEC cache refresh is already running. Waiting...")
+            time.sleep(5)
+
+    try:
+        yield
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)
+
+
 def build_sec_database(force: bool = False) -> pd.DataFrame:
     if not force and (SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists()):
         df = read_sec_database()
         if not SEC_SQLITE_FILE.exists():
-            write_sqlite_database(df)
+            with cache_build_lock():
+                if not SEC_SQLITE_FILE.exists():
+                    write_sqlite_database(df)
         return df
 
-    try:
-        df = download_sec_database()
-    except Exception as exc:
-        if SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists():
-            logger.exception("SEC download failed. Keeping existing cache. Error: %s", exc)
+    with cache_build_lock():
+        if not force and (SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists()):
             return read_sec_database()
-        logger.exception("SEC download failed and no cache exists. Using fallback database. Error: %s", exc)
-        df = fallback_database()
 
-    write_sec_database(df)
-    ensure_alias_file()
-    return df
+        try:
+            df = download_sec_database()
+        except Exception as exc:
+            if SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists():
+                logger.exception("SEC download failed. Keeping existing cache. Error: %s", exc)
+                return read_sec_database()
+            logger.exception("SEC download failed and no cache exists. Using fallback database. Error: %s", exc)
+            df = fallback_database()
+
+        write_sec_database(df)
+        ensure_alias_file()
+        return df
 
 
 def ensure_alias_file(path: Path = ALIAS_FILE) -> Path:

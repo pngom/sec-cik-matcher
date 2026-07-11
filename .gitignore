@@ -8,4 +8,5 @@ logs/
 data/sec_companies.parquet
 data/sec_companies.csv
 data/sec_companies.sqlite
+data/.sec_cache_build.lock
 *.tmp
