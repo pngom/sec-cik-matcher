@@ -12,7 +12,7 @@ from config import (
     SEC_CACHE_FILE,
 )
 from matcher import MatchConfig, SECMatcher
-from sec_database import build_sec_database, load_aliases, read_sec_database
+from sec_database import build_sec_database, load_aliases, read_sec_database, sec_database_summary
 from utils import (
     dataframe_to_csv_bytes,
     dataframe_to_excel_bytes,
@@ -92,9 +92,9 @@ def source_dataframe(uploaded_file) -> tuple[pd.DataFrame, str]:
 def render_sidebar() -> int:
     with st.sidebar:
         st.header("Data")
-        current_sec_df = load_cached_sec_data(sec_cache_signature())
-        st.metric("SEC companies", f"{len(current_sec_df):,}")
-        if len(current_sec_df) < 1000:
+        cache_summary = sec_database_summary()
+        st.metric("SEC cache", cache_summary["status"])
+        if cache_summary["is_fallback"]:
             st.warning("SEC cache is using the small fallback dataset. Refresh with network access for full matching.")
         st.caption("Persistent cache")
         st.write(f"SEC Parquet: `{describe_file(SEC_CACHE_FILE)}`")

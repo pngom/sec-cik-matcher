@@ -168,6 +168,18 @@ def read_sec_database(cache_path: Path | None = None) -> pd.DataFrame:
     return fallback_database()
 
 
+def sec_database_summary() -> dict[str, Any]:
+    if SEC_CACHE_FILE.exists():
+        size_mb = SEC_CACHE_FILE.stat().st_size / (1024 * 1024)
+        status = f"{size_mb:.1f} MB"
+        is_fallback = SEC_CACHE_FILE.stat().st_size < 100_000
+        return {"status": status, "is_fallback": is_fallback}
+    if SEC_CACHE_FALLBACK_FILE.exists():
+        size_kb = SEC_CACHE_FALLBACK_FILE.stat().st_size / 1024
+        return {"status": f"{size_kb:.1f} KB CSV", "is_fallback": True}
+    return {"status": "fallback", "is_fallback": True}
+
+
 def build_sec_database(force: bool = False) -> pd.DataFrame:
     if not force and (SEC_CACHE_FILE.exists() or SEC_CACHE_FALLBACK_FILE.exists()):
         return read_sec_database()

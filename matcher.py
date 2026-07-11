@@ -25,74 +25,79 @@ class SECMatcher:
         config: MatchConfig | None = None,
     ) -> None:
         self.config = config or MatchConfig()
-        self.sec_df = (sec_df if sec_df is not None else read_sec_database()).copy().fillna("")
+        self.sec_df = (sec_df if sec_df is not None else read_sec_database()).copy().fillna("").reset_index(drop=True)
         self.aliases = (aliases if aliases is not None else load_aliases()).copy().fillna("")
         self.index = self._build_index()
+        self.alias_index = self._build_alias_index()
         self.ticker_index = self._build_ticker_index()
         self.choices = list(self.index.keys())
+        self.prefix_index = self._build_prefix_index()
+        self.fuzzy_prefix_index = self._build_fuzzy_prefix_index()
         logger.info("Matcher initialized with %s searchable names", len(self.choices))
 
-    def _build_index(self) -> dict[str, list[dict[str, Any]]]:
-        index: dict[str, list[dict[str, Any]]] = {}
-
-        def add_choice(choice: str, record: dict[str, Any]) -> None:
-            normalized = normalize_company_name(choice)
+    def _build_index(self) -> dict[str, list[int]]:
+        index: dict[str, list[int]] = {}
+        for row in self.sec_df.itertuples(index=True):
+            normalized = str(getattr(row, "normalized_name", "") or normalize_company_name(getattr(row, "name", "")))
             if normalized:
-                index.setdefault(normalized, []).append(record)
+                index.setdefault(normalized, []).append(int(row.Index))
+        return index
 
-        for row in self.sec_df.to_dict("records"):
-            record = {
-                "cik": str(row.get("cik", "")).zfill(10),
-                "name": row.get("name", ""),
-                "ticker": row.get("ticker", ""),
-                "source": "sec",
-            }
-            add_choice(record["name"], record)
-
-        sec_by_cik = {
-            str(row.get("cik", "")).zfill(10): row
-            for row in self.sec_df.to_dict("records")
-            if str(row.get("cik", "")).strip()
-        }
-        sec_by_name = {
-            normalize_company_name(row.get("name", "")): row
-            for row in self.sec_df.to_dict("records")
-            if str(row.get("name", "")).strip()
-        }
+    def _build_alias_index(self) -> dict[str, dict[str, Any]]:
+        alias_index: dict[str, dict[str, Any]] = {}
+        sec_by_cik: dict[str, int] = {}
+        sec_by_name: dict[str, int] = {}
+        for row in self.sec_df.itertuples(index=True):
+            cik = str(getattr(row, "cik", "")).zfill(10)
+            normalized = str(getattr(row, "normalized_name", "") or normalize_company_name(getattr(row, "name", "")))
+            if cik and cik not in sec_by_cik:
+                sec_by_cik[cik] = int(row.Index)
+            if normalized and normalized not in sec_by_name:
+                sec_by_name[normalized] = int(row.Index)
 
         for alias in self.aliases.to_dict("records"):
             cik = str(alias.get("cik", "")).zfill(10)
             canonical = str(alias.get("canonical_name", ""))
-            target = sec_by_cik.get(cik) or sec_by_name.get(normalize_company_name(canonical))
-            if not target:
+            target_index = sec_by_cik.get(cik)
+            if target_index is None:
+                target_index = sec_by_name.get(normalize_company_name(canonical))
+            if target_index is None:
                 continue
-            record = {
-                "cik": str(target.get("cik", "")).zfill(10),
-                "name": target.get("name", canonical),
-                "ticker": target.get("ticker", ""),
-                "source": "alias",
-            }
-            add_choice(str(alias.get("alias", "")), record)
+            normalized_alias = normalize_company_name(str(alias.get("alias", "")))
+            if normalized_alias:
+                alias_index[normalized_alias] = self._record_from_index(target_index, source="alias")
 
-        return index
+        return alias_index
 
-    def _build_ticker_index(self) -> dict[str, dict[str, Any]]:
-        ticker_index = {}
-        for row in self.sec_df.to_dict("records"):
-            ticker = str(row.get("ticker", "")).upper().strip()
+    def _build_ticker_index(self) -> dict[str, int]:
+        ticker_index: dict[str, int] = {}
+        for row in self.sec_df.itertuples(index=True):
+            ticker = str(getattr(row, "ticker", "")).upper().strip()
             if ticker:
-                record = {
-                    "cik": str(row.get("cik", "")).zfill(10),
-                    "name": row.get("name", ""),
-                    "ticker": ticker,
-                    "source": "ticker",
-                }
+                row_index = int(row.Index)
                 existing = ticker_index.get(ticker)
-                if not existing or len(normalize_company_name(record["name"])) < len(
-                    normalize_company_name(existing["name"])
+                if existing is None or len(normalize_company_name(self.sec_df.at[row_index, "name"])) < len(
+                    normalize_company_name(self.sec_df.at[existing, "name"])
                 ):
-                    ticker_index[ticker] = record
+                    ticker_index[ticker] = row_index
         return ticker_index
+
+    def _build_prefix_index(self) -> dict[str, list[str]]:
+        prefix_index: dict[str, list[str]] = {}
+        for choice in self.index:
+            first_token = choice.split(" ", 1)[0]
+            if first_token:
+                prefix_index.setdefault(first_token, []).append(choice)
+        for matches in prefix_index.values():
+            matches.sort(key=lambda choice: (len(choice), choice))
+        return prefix_index
+
+    def _build_fuzzy_prefix_index(self) -> dict[str, list[str]]:
+        fuzzy_prefix_index: dict[str, list[str]] = {}
+        for choice in self.index:
+            if len(choice) >= 3:
+                fuzzy_prefix_index.setdefault(choice[:3], []).append(choice)
+        return fuzzy_prefix_index
 
     def match_name(self, company_name: object) -> dict[str, Any]:
         query = normalize_company_name(company_name)
@@ -100,26 +105,34 @@ class SECMatcher:
             return self._empty_result(company_name, query)
 
         if query in self.ticker_index:
-            record = self.ticker_index[query]
+            record = self._record_from_index(self.ticker_index[query], source="ticker")
             return self._result(company_name, query, query, 100, record, "exact")
 
         if query in self.index:
-            record = self.index[query][0]
+            record = self._record_from_index(self.index[query][0])
+            return self._result(company_name, query, query, 100, record, "exact")
+
+        if query in self.alias_index:
+            record = self.alias_index[query]
             return self._result(company_name, query, query, 100, record, "exact")
 
         prefix_matches = self._prefix_matches(query)
         if prefix_matches:
             matched_key = prefix_matches[0]
-            record = self.index[matched_key][0]
+            record = self._record_from_index(self.index[matched_key][0])
             status = "matched" if len(prefix_matches) == 1 else "review"
             return self._result(company_name, query, matched_key, 92.0, record, status)
 
-        match = process.extractOne(query, self.choices, scorer=fuzz.token_sort_ratio)
+        candidates = self._fuzzy_candidates(query)
+        if not candidates:
+            return self._empty_result(company_name, query)
+
+        match = process.extractOne(query, candidates, scorer=fuzz.token_sort_ratio)
         if not match:
             return self._empty_result(company_name, query)
 
         matched_key, score, _ = match
-        record = self.index[matched_key][0]
+        record = self._record_from_index(self.index[matched_key][0])
         status = "matched" if score >= self.config.score_threshold else "review"
         return self._result(company_name, query, matched_key, round(float(score), 2), record, status)
 
@@ -127,9 +140,23 @@ class SECMatcher:
         if len(query) < 4:
             return []
         prefix = f"{query} "
-        matches = [choice for choice in self.choices if choice.startswith(prefix)]
-        matches.sort(key=lambda choice: (len(choice), choice))
+        first_token = query.split(" ", 1)[0]
+        matches = [choice for choice in self.prefix_index.get(first_token, []) if choice.startswith(prefix)]
         return matches
+
+    def _fuzzy_candidates(self, query: str) -> list[str]:
+        if len(query) < 3:
+            return []
+        return self.fuzzy_prefix_index.get(query[:3], [])
+
+    def _record_from_index(self, index: int, source: str = "sec") -> dict[str, Any]:
+        row = self.sec_df.iloc[index]
+        return {
+            "cik": str(row.get("cik", "")).zfill(10),
+            "name": row.get("name", ""),
+            "ticker": row.get("ticker", ""),
+            "source": source,
+        }
 
     def match_dataframe(self, df: pd.DataFrame, company_column: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         if company_column not in df.columns:
