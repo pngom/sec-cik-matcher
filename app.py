@@ -12,7 +12,8 @@ from config import (
     SEC_CACHE_FILE,
 )
 from matcher import MatchConfig, SECMatcher
-from sec_database import build_sec_database, load_aliases, read_sec_database, sec_database_summary
+import sec_database
+from sec_database import build_sec_database, load_aliases, read_sec_database
 from utils import (
     dataframe_to_csv_bytes,
     dataframe_to_excel_bytes,
@@ -78,6 +79,18 @@ def sec_cache_signature() -> tuple[str, int, int]:
     return ("fallback", 0, 0)
 
 
+def get_sec_database_summary() -> dict[str, object]:
+    if hasattr(sec_database, "sec_database_summary"):
+        return sec_database.sec_database_summary()
+    if SEC_CACHE_FILE.exists():
+        size_mb = SEC_CACHE_FILE.stat().st_size / (1024 * 1024)
+        return {"status": f"{size_mb:.1f} MB", "is_fallback": SEC_CACHE_FILE.stat().st_size < 100_000}
+    if SEC_CACHE_FALLBACK_FILE.exists():
+        size_kb = SEC_CACHE_FALLBACK_FILE.stat().st_size / 1024
+        return {"status": f"{size_kb:.1f} KB CSV", "is_fallback": True}
+    return {"status": "fallback", "is_fallback": True}
+
+
 def reset_caches() -> None:
     load_cached_sec_data.clear()
     get_matcher.clear()
@@ -92,7 +105,7 @@ def source_dataframe(uploaded_file) -> tuple[pd.DataFrame, str]:
 def render_sidebar() -> int:
     with st.sidebar:
         st.header("Data")
-        cache_summary = sec_database_summary()
+        cache_summary = get_sec_database_summary()
         st.metric("SEC cache", cache_summary["status"])
         if cache_summary["is_fallback"]:
             st.warning("SEC cache is using the small fallback dataset. Refresh with network access for full matching.")
