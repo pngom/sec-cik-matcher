@@ -4,21 +4,15 @@ import pandas as pd
 import streamlit as st
 
 from config import (
-    ALIAS_FILE,
     APP_NAME,
     DEFAULT_SCORE_THRESHOLD,
     DEMO_FILE,
-    SEC_CACHE_FALLBACK_FILE,
-    SEC_CACHE_FILE,
-    SEC_SQLITE_FILE,
 )
 from matcher import MatchConfig, SQLiteSECMatcher
-import sec_database
-from sec_database import build_sec_database, load_aliases
+from sec_database import load_aliases
 from utils import (
     dataframe_to_csv_bytes,
     dataframe_to_excel_bytes,
-    describe_file,
     detect_company_column,
     logger,
     read_uploaded_table,
@@ -30,22 +24,71 @@ st.set_page_config(page_title=APP_NAME, page_icon=":mag:", layout="wide")
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 1.7rem; max-width: 1180px; }
-    div[data-testid="stMetric"] {
-        border: 1px solid #e5e7eb;
-        border-radius: 8px;
-        padding: 0.8rem 0.9rem;
-        background: #ffffff;
+    .stApp {
+        background: #fbfaf7;
+        color: #20272b;
     }
-    .app-subtitle { color: #4b5563; font-size: 1.02rem; margin-top: -0.5rem; }
-    .status-pill {
-        display: inline-block;
-        border: 1px solid #d1d5db;
-        border-radius: 999px;
-        padding: 0.15rem 0.55rem;
-        color: #374151;
-        background: #f9fafb;
-        font-size: 0.82rem;
+    .block-container {
+        max-width: 1080px;
+        padding-top: 4.2rem;
+        padding-bottom: 4rem;
+    }
+    h1, h2, h3, p, label, [data-testid="stMarkdownContainer"] {
+        font-family: "Source Sans Pro", "Segoe UI", sans-serif;
+    }
+    h1 {
+        font-weight: 400;
+        letter-spacing: -0.035em;
+        margin-bottom: 0.45rem;
+    }
+    h2, h3 {
+        font-weight: 400;
+        letter-spacing: -0.02em;
+    }
+    [data-testid="stFileUploader"] {
+        background: #f1f0eb;
+        border: 1px solid #e2e0d8;
+        border-radius: 10px;
+        padding: 0.45rem 0.8rem;
+    }
+    [data-testid="stFileUploaderDropzone"] {
+        border: 0;
+        background: transparent;
+    }
+    [data-testid="stExpander"] {
+        border: 1px solid #dedbd3;
+        border-radius: 8px;
+        background: transparent;
+    }
+    [data-testid="stDataFrame"] {
+        border: 1px solid #dedbd3;
+        border-radius: 8px;
+    }
+    .eyebrow {
+        color: #6d716e;
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.075em;
+        margin-bottom: 1rem;
+    }
+    .app-subtitle {
+        color: #5f6561;
+        font-size: 1.08rem;
+        max-width: 760px;
+        margin-bottom: 2.2rem;
+    }
+    .results-summary {
+        color: #5f6561;
+        margin: -0.35rem 0 1.25rem;
+    }
+    [data-testid="stButton"] button[kind="primary"] {
+        background: #356b5c;
+        border-color: #356b5c;
+        color: #ffffff;
+    }
+    [data-testid="stButton"] button[kind="primary"]:hover {
+        background: #2a584c;
+        border-color: #2a584c;
     }
     </style>
     """,
@@ -67,27 +110,13 @@ def get_matcher(score_threshold: int, cache_signature: tuple[str, int, int]) -> 
 
 
 def sec_cache_signature() -> tuple[str, int, int]:
+    from config import SEC_CACHE_FALLBACK_FILE, SEC_CACHE_FILE, SEC_SQLITE_FILE
+
     for path in (SEC_SQLITE_FILE, SEC_CACHE_FILE, SEC_CACHE_FALLBACK_FILE):
         if path.exists():
             stat = path.stat()
             return (path.name, stat.st_size, int(stat.st_mtime))
     return ("fallback", 0, 0)
-
-
-def get_sec_database_summary() -> dict[str, object]:
-    if hasattr(sec_database, "sec_database_summary"):
-        return sec_database.sec_database_summary()
-    if SEC_CACHE_FILE.exists():
-        size_mb = SEC_CACHE_FILE.stat().st_size / (1024 * 1024)
-        return {"status": f"{size_mb:.1f} MB", "is_fallback": SEC_CACHE_FILE.stat().st_size < 100_000}
-    if SEC_CACHE_FALLBACK_FILE.exists():
-        size_kb = SEC_CACHE_FALLBACK_FILE.stat().st_size / 1024
-        return {"status": f"{size_kb:.1f} KB CSV", "is_fallback": True}
-    return {"status": "fallback", "is_fallback": True}
-
-
-def reset_caches() -> None:
-    get_matcher.clear()
 
 
 def source_dataframe(uploaded_file) -> tuple[pd.DataFrame, str]:
@@ -96,52 +125,16 @@ def source_dataframe(uploaded_file) -> tuple[pd.DataFrame, str]:
     return read_uploaded_table(uploaded_file), uploaded_file.name
 
 
-def render_sidebar() -> int:
-    with st.sidebar:
-        st.header("Data")
-        cache_summary = get_sec_database_summary()
-        st.metric("SEC cache", cache_summary["status"])
-        if cache_summary["is_fallback"]:
-            st.warning("SEC cache is using the small fallback dataset. Refresh with network access for full matching.")
-        st.caption("Persistent cache")
-        st.write(f"SEC Parquet: `{describe_file(SEC_CACHE_FILE)}`")
-        st.write(f"SEC CSV: `{describe_file(SEC_CACHE_FALLBACK_FILE)}`")
-        st.write(f"Aliases: `{describe_file(ALIAS_FILE)}`")
-
-        if st.button("Refresh SEC cache", width="stretch"):
-            with st.spinner("Downloading SEC company data..."):
-                build_sec_database(force=True)
-                reset_caches()
-            st.success("SEC cache refreshed.")
-
-        st.divider()
-        st.header("Matching")
-        threshold = st.slider(
-            "Review threshold",
-            min_value=60,
-            max_value=100,
-            value=DEFAULT_SCORE_THRESHOLD,
-            help="Rows below this fuzzy score are flagged for review.",
-        )
-        st.caption("Set `SEC_USER_AGENT` in Streamlit secrets for production SEC requests.")
-        return threshold
-
-
 def main() -> None:
-    threshold = render_sidebar()
-
-    st.image(
-        "https://pngom.github.io/PNgom%20Profile%20Picture%20resized.jpg",
-        caption="Pappe Ngom",
-        width=140,
-    )
-    st.title(APP_NAME)
+    threshold = DEFAULT_SCORE_THRESHOLD
+    st.markdown('<div class="eyebrow">COMPANY MATCHING</div>', unsafe_allow_html=True)
+    st.title("Match company names")
     st.markdown(
-        '<p class="app-subtitle">Upload company names, match them to SEC identifiers, review low-confidence rows, and export a clean file.</p>',
+        '<p class="app-subtitle">Upload a list of company names and get their official SEC company ID (CIK), ticker symbol, and best match. You can download the completed list when you are done.</p>',
         unsafe_allow_html=True,
     )
 
-    uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+    uploaded_file = st.file_uploader("Upload your company list", type=["csv", "xlsx", "xls"])
 
     try:
         df, source_name = source_dataframe(uploaded_file)
@@ -155,27 +148,29 @@ def main() -> None:
         return
 
     auto_column = detect_company_column(df)
-    top_cols = st.columns([1.4, 1, 1])
-    with top_cols[0]:
-        company_column = st.selectbox(
-            "Company name column",
-            options=list(df.columns),
-            index=list(df.columns).index(auto_column),
-        )
-    with top_cols[1]:
-        st.metric("Input rows", f"{len(df):,}")
-    with top_cols[2]:
-        st.metric("Input columns", f"{len(df.columns):,}")
+    company_column = st.selectbox(
+        "Which column contains the company names?",
+        options=list(df.columns),
+        index=list(df.columns).index(auto_column),
+    )
+    st.caption(f"Using {source_name.lower()} with {len(df):,} companies.")
 
-    st.markdown(f'<span class="status-pill">Source: {source_name}</span>', unsafe_allow_html=True)
-
-    with st.expander("Preview input", expanded=uploaded_file is None):
+    with st.expander("Preview your list", expanded=uploaded_file is None):
         st.dataframe(df.head(100), width="stretch", hide_index=True)
 
-    run_match = st.button("Match companies", type="primary", width="stretch")
+    with st.expander("Matching options"):
+        threshold = st.slider(
+            "How certain should a match be before it is marked ready?",
+            min_value=60,
+            max_value=100,
+            value=DEFAULT_SCORE_THRESHOLD,
+            help="Lower settings match more names automatically. Higher settings send more names to review.",
+        )
+
+    run_match = st.button("Find matches", type="primary", width="stretch")
 
     if run_match:
-        with st.spinner("Matching against SEC cache..."):
+        with st.spinner("Looking for company matches..."):
             matcher = get_matcher(threshold, sec_cache_signature())
             matched_df, summary = matcher.match_dataframe(df, company_column)
             st.session_state["matched_df"] = matched_df
@@ -184,21 +179,21 @@ def main() -> None:
     matched_df = st.session_state.get("matched_df")
     summary = st.session_state.get("summary")
     if matched_df is None:
-        st.info("Use the demo data or upload your own file, then run the match.")
+        st.info("Upload a company list, then choose Find matches. You can also try the included example.")
         return
 
-    st.subheader("Results")
+    st.subheader("Your matches")
     exact_or_matched = int(matched_df["match_status"].isin(["exact", "matched"]).sum())
     review = int(matched_df["match_status"].eq("review").sum())
     unmatched = int(matched_df["match_status"].isin(["unmatched", "blank"]).sum())
 
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Matched", f"{exact_or_matched:,}")
-    metric_cols[1].metric("Needs review", f"{review:,}")
-    metric_cols[2].metric("Unmatched", f"{unmatched:,}")
-    metric_cols[3].metric("Best avg score", f"{matched_df['match_score'].mean():.1f}")
+    st.markdown(
+        f'<p class="results-summary"><strong>{exact_or_matched:,}</strong> matched &nbsp;·&nbsp; '
+        f'<strong>{review:,}</strong> to review &nbsp;·&nbsp; <strong>{unmatched:,}</strong> not found</p>',
+        unsafe_allow_html=True,
+    )
 
-    tabs = st.tabs(["Matched File", "Review Queue", "Summary", "Aliases"])
+    tabs = st.tabs(["All matches", "Review these", "Match summary"])
     with tabs[0]:
         st.dataframe(matched_df, width="stretch", hide_index=True)
     with tabs[1]:
@@ -206,9 +201,6 @@ def main() -> None:
         st.dataframe(review_df, width="stretch", hide_index=True)
     with tabs[2]:
         st.dataframe(summary, width="stretch", hide_index=True)
-    with tabs[3]:
-        aliases = load_aliases()
-        st.dataframe(aliases[["alias", "canonical_name", "cik"]], width="stretch", hide_index=True)
 
     download_cols = st.columns([1, 1, 2])
     with download_cols[0]:
